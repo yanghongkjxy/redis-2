@@ -52,6 +52,7 @@ type Options struct {
 	OnClose func(*Conn) error
 
 	PoolSize           int
+	MinIdleConns       int
 	PoolTimeout        time.Duration
 	IdleTimeout        time.Duration
 	IdleCheckFrequency time.Duration
@@ -70,7 +71,7 @@ type ConnPool struct {
 	connsMu sync.Mutex
 	conns   []*Conn
 
-	freeConnsMu sync.Mutex
+	freeConnsMu sync.RWMutex
 	freeConns   []*Conn
 
 	stats Stats
@@ -88,9 +89,16 @@ func NewConnPool(opt *Options) *ConnPool {
 		conns:     make([]*Conn, 0, opt.PoolSize),
 		freeConns: make([]*Conn, 0, opt.PoolSize),
 	}
+
+	for i := 0; i < opt.MinIdleConns; i++ {
+		p.queue <- struct{}{}
+		p.addIdleConn()
+	}
+
 	if opt.IdleTimeout > 0 && opt.IdleCheckFrequency > 0 {
 		go p.reaper(opt.IdleCheckFrequency)
 	}
+
 	return p
 }
 
@@ -231,8 +239,29 @@ func (p *ConnPool) Put(cn *Conn) error {
 
 func (p *ConnPool) Remove(cn *Conn) error {
 	_ = p.CloseConn(cn)
+
+	var addIdleConn bool
+	if p.opt.MinIdleConns > 0 {
+		p.freeConnsMu.RLock()
+		addIdleConn = len(p.freeConns) < p.opt.MinIdleConns
+		p.freeConnsMu.RUnlock()
+	}
+	if addIdleConn {
+		go p.addIdleConn()
+		return nil
+	}
+
 	<-p.queue
 	return nil
+}
+
+func (p *ConnPool) addIdleConn() {
+	cn, err := p.NewConn()
+	if err == nil {
+		_ = p.Put(cn)
+	} else {
+		<-p.queue
+	}
 }
 
 func (p *ConnPool) CloseConn(cn *Conn) error {
